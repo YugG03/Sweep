@@ -25,7 +25,7 @@ jobs:
         run: flutter pub add flutter_blue_plus permission_handler
 
       - name: Use our app code
-        run: cp app_src/main.dart lib/main.dart
+        run: cp -r app_src/. lib/
 
       - name: Add Bluetooth permissions (Android)
         run: |
@@ -36,6 +36,13 @@ jobs:
         run: |
           sed -i 's/compileSdk = flutter.compileSdkVersion/compileSdk = 37/' android/app/build.gradle.kts
           grep -n "compileSdk" android/app/build.gradle.kts
+
+      - name: Show flutter_blue_plus version
+        run: grep -A4 "flutter_blue_plus:" pubspec.lock | head -8
+
+      - name: Analyze code
+        run: flutter analyze lib
+        continue-on-error: true
 
       - name: Build APK
         run: flutter build apk --release
