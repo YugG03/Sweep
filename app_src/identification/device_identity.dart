@@ -61,7 +61,7 @@ class CategoryGuess {
 
 // ---------- Identification logic ----------
 
-class DeviceIdentifier {
+class BleIdentity {
   static final _macLike =
       RegExp(r'^([0-9a-f]{2}[:\-]){5}[0-9a-f]{2}$', caseSensitive: false);
 
