@@ -1,7 +1,17 @@
 name: Build Android APK
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'app_src/**'
+      - 'test_src/**'
+      - '.github/workflows/build.yml'
   workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
