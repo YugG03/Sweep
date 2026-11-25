@@ -65,9 +65,9 @@ class Tracked {
 
   String get displayName => deviceName ?? userNote ?? '';
 
-  String? get manufacturer => DeviceIdentifier.manufacturer(companyId);
+  String? get manufacturer => BleIdentity.manufacturer(companyId);
 
-  CategoryGuess? get category => DeviceIdentifier.classify(
+  CategoryGuess? get category => BleIdentity.classify(
         appearance: appearance,
         companyId: companyId,
         payload: payload,
@@ -76,9 +76,9 @@ class Tracked {
       );
 
   String? get brandHint =>
-      deviceName == null ? null : DeviceIdentifier.brandFromName(deviceName!);
+      deviceName == null ? null : BleIdentity.brandFromName(deviceName!);
 
-  IdentificationStatus get status => DeviceIdentifier.status(
+  IdentificationStatus get status => BleIdentity.status(
         hasName: deviceName != null,
         hasManufacturer: manufacturer != null,
         hasOtherEvidence:
@@ -183,7 +183,7 @@ class _BleScreenState extends State<BleScreen> {
       _bonded.clear();
       for (final d in await FlutterBluePlus.bondedDevices) {
         _bonded[d.remoteId.str] =
-            DeviceIdentifier.cleanName(d.platformName, remoteId: d.remoteId.str);
+            BleIdentity.cleanName(d.platformName, remoteId: d.remoteId.str);
       }
     } catch (_) {
       // Not available on this platform; scanning still works.
@@ -238,13 +238,13 @@ class _BleScreenState extends State<BleScreen> {
     final dev = BluetoothDevice.fromId(t.id);
     String? name;
     try {
-      await dev.connect(timeout: const Duration(seconds: 8));
+      await dev.connect(license: License.free, timeout: const Duration(seconds: 8));
       final services = await dev.discoverServices();
       for (final s in services) {
         if (s.uuid.str.toLowerCase() != '1800') continue;
         for (final c in s.characteristics) {
           if (c.uuid.str.toLowerCase() == '2a00') {
-            name = DeviceIdentifier.decodeName(await c.read());
+            name = BleIdentity.decodeName(await c.read());
           }
         }
       }
@@ -309,8 +309,8 @@ class _BleScreenState extends State<BleScreen> {
       });
 
       // Names: only ever replace with a valid, non-empty value.
-      final adName = DeviceIdentifier.cleanName(ad.advName, remoteId: id);
-      final platName = DeviceIdentifier.cleanName(r.device.platformName, remoteId: id) ??
+      final adName = BleIdentity.cleanName(ad.advName, remoteId: id);
+      final platName = BleIdentity.cleanName(r.device.platformName, remoteId: id) ??
           _bonded[id];
       if (adName != null) t.advName = adName;
       if (platName != null) t.platformName = platName;
@@ -443,7 +443,7 @@ class _MeterCard extends StatelessWidget {
   List<String> get _details {
     final d = device;
     final cat = d.category;
-    final hint = DeviceIdentifier.serviceHint(d.services);
+    final hint = BleIdentity.serviceHint(d.services);
     final cid = d.companyId == null
         ? ''
         : ' (company ID 0x${d.companyId!.toRadixString(16).padLeft(4, '0')})';
