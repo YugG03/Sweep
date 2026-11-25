@@ -45,23 +45,27 @@ jobs:
         run: |
           flutter create --org com.example --project-name sweep_app --platforms=android,ios .
 
-      - name: Install Android SDK 37
+      - name: Install Android SDK 37 preview
         run: |
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
 
-          SDKMANAGER=$(find "${ANDROID_HOME:-$ANDROID_SDK_ROOT}" \
-            -type f -name sdkmanager 2>/dev/null | head -n 1)
+          if [ ! -f "$SDKMANAGER" ]; then
+            SDKMANAGER=$(find "$ANDROID_HOME" -type f -name sdkmanager | head -n 1)
+          fi
 
-          if [ -z "$SDKMANAGER" ]; then
-            echo "ERROR: sdkmanager was not found."
-            find "${ANDROID_HOME:-$ANDROID_SDK_ROOT}" \
-              -maxdepth 4 -type f -name sdkmanager 2>/dev/null || true
+          if [ -z "$SDKMANAGER" ] || [ ! -f "$SDKMANAGER" ]; then
+            echo "ERROR: sdkmanager not found."
             exit 1
           fi
 
-          echo "Using sdkmanager: $SDKMANAGER"
-          "$SDKMANAGER" "platforms;android-37"
+          echo "Installing Android 17 API 37 preview platform..."
+          yes | "$SDKMANAGER" \
+            --sdk_root="$ANDROID_HOME" \
+            --channel=3 \
+            "platforms;android-37.0"
+
+          echo "Installed Android platforms:"
+          ls -la "$ANDROID_HOME/platforms/"
 
       - name: Add packages
         run: |
