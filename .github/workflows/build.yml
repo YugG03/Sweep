@@ -21,11 +21,17 @@ jobs:
       - name: Create Flutter project shell
         run: flutter create --org com.example --project-name sweep_app --platforms=android,ios .
 
+      # audioplayers is not pinned yet: run once, read its version in the
+      # "Show package versions" step, then pin it here like the other two.
       - name: Add packages
-        run: flutter pub add flutter_blue_plus permission_handler
+        run: flutter pub add flutter_blue_plus:2.3.15 permission_handler:13.0.2 audioplayers
 
       - name: Use our app code
-        run: cp -r app_src/. lib/
+        run: |
+          cp -r app_src/. lib/
+          rm -f test/widget_test.dart
+          mkdir -p test
+          cp -r test_src/. test/
 
       - name: Add Bluetooth permissions (Android)
         run: |
@@ -37,12 +43,14 @@ jobs:
           sed -i 's/compileSdk = flutter.compileSdkVersion/compileSdk = 37/' android/app/build.gradle.kts
           grep -n "compileSdk" android/app/build.gradle.kts
 
-      - name: Show flutter_blue_plus version
-        run: grep -A4 "flutter_blue_plus:" pubspec.lock | head -8
+      - name: Show package versions
+        run: flutter pub deps --style=compact | grep -E "(flutter_blue_plus|permission_handler|audioplayers) " || true
 
       - name: Analyze code
-        run: flutter analyze lib
-        continue-on-error: true
+        run: flutter analyze --no-fatal-infos lib test
+
+      - name: Run tests
+        run: flutter test
 
       - name: Build APK
         run: flutter build apk --release

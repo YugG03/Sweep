@@ -65,15 +65,45 @@ class BleIdentity {
   static final _macLike =
       RegExp(r'^([0-9a-f]{2}[:\-]){5}[0-9a-f]{2}$', caseSensitive: false);
 
-  /// Returns a usable device name, or null. Rejects empty text, control
-  /// characters, MAC-address-looking text and the remote identifier itself.
+  /// Returns a usable device name, or null. Rejects empty text, placeholders,
+  /// control characters, MAC-address-looking text and the remote identifier.
   static String? cleanName(String? raw, {String? remoteId}) {
     if (raw == null) return null;
     final s = raw.replaceAll(RegExp(r'[\u0000-\u001F]'), '').trim();
     if (s.isEmpty) return null;
     if (_macLike.hasMatch(s)) return null;
     if (remoteId != null && s.toLowerCase() == remoteId.toLowerCase()) return null;
+
+    final normalized = s.toLowerCase();
+    if (const {'unknown', 'unnamed', 'n/a', 'null'}.contains(normalized)) {
+      return null;
+    }
     return s;
+  }
+
+  /// Keeps a stable valid name across duplicate observations. If one name is
+  /// an obvious shortened form of the other, the more complete form wins.
+  static String? preferName(
+    String? current,
+    String? candidate, {
+    String? remoteId,
+  }) {
+    final oldName = cleanName(current, remoteId: remoteId);
+    final newName = cleanName(candidate, remoteId: remoteId);
+    if (oldName == null) return newName;
+    if (newName == null) return oldName;
+
+    final oldKey = oldName.toLowerCase();
+    final newKey = newName.toLowerCase();
+    if (oldKey == newKey) {
+      return newName.length > oldName.length ? newName : oldName;
+    }
+    if (newKey.contains(oldKey)) return newName;
+    if (oldKey.contains(newKey)) return oldName;
+
+    // Conflicting non-empty observations are not enough evidence to replace a
+    // name that was already accepted for this remote identifier.
+    return oldName;
   }
 
   static String? decodeName(List<int> bytes) =>
@@ -148,6 +178,9 @@ class BleIdentity {
           return const CategoryGuess(DeviceCategory.smartphone, 'device says it is a phone');
         case 3:
           return const CategoryGuess(DeviceCategory.smartwatch, 'device says it is a watch');
+        case 33:
+          return const CategoryGuess(
+              DeviceCategory.speaker, 'device says it is an audio output device');
         case 37:
           return const CategoryGuess(
               DeviceCategory.headphones, 'device says it is wearable audio');
@@ -156,9 +189,21 @@ class BleIdentity {
         case 18:
           return const CategoryGuess(DeviceCategory.fitnessTracker,
               'device says it is a heart-rate, running or cycling sensor');
-        case 36:
+        case 21: // Generic sensor
+        case 22: // Light fixture
+        case 23: // Fan
+        case 24: // HVAC
+        case 25: // Air conditioning
+        case 26: // Humidifier
+        case 27: // Heating
+        case 28: // Access control
+        case 29: // Motorized device
+        case 30: // Power device
+        case 31: // Light source
+        case 32: // Window covering
+        case 36: // Domestic appliance
           return const CategoryGuess(
-              DeviceCategory.smartHome, 'device says it is a domestic appliance');
+              DeviceCategory.smartHome, 'device appearance indicates home equipment');
         case 8:
         case 9:
           return const CategoryGuess(DeviceCategory.other, 'device says it is a tag or keyring');

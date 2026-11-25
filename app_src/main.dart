@@ -1,10 +1,12 @@
 import 'dart:async';
-import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import 'identification/device_identity.dart';
+import 'tracking/detector_view.dart';
+import 'tracking/pulse_engine.dart';
+import 'tracking/signal_tracker.dart';
 
 void main() => runApp(const SweepApp());
 
@@ -42,10 +44,7 @@ class Tracked {
   int? appearance;
   Set<String> services = {};
 
-  double? ema; // smoothed RSSI
-  int peak = -127;
-  int txPower = -59; // assumed RSSI at 1 m
-  DateTime lastSeen = DateTime.now();
+  final SignalTracker signal = SignalTracker();
   bool identifying = false;
 
   Tracked(this.id);
@@ -86,24 +85,17 @@ class Tracked {
         nameReadFailed: nameReadFailed,
       );
 
-  // ----- signal tracking (unchanged) -----
+  // ----- signal tracking (see tracking/signal_tracker.dart) -----
 
-  void update(int rssi, int? tx) {
-    const alpha = 0.25;
-    ema = ema == null ? rssi.toDouble() : alpha * rssi + (1 - alpha) * ema!;
-    if (rssi > peak) peak = rssi;
-    if (tx != null) txPower = tx;
-    lastSeen = DateTime.now();
-  }
-
-  // Very rough. Treat as "about", never exact.
-  double get meters {
-    const n = 2.5;
-    return pow(10, (txPower - (ema ?? -100)) / (10 * n)).toDouble();
-  }
-
-  // 0.0 (cold) .. 1.0 (hot)
-  double get heat => (((ema ?? -100) + 100) / 60).clamp(0.0, 1.0);
+  double? get ema => signal.ema;
+  int get peak => signal.peak;
+  DateTime get lastSeen => signal.lastSeen;
+  bool get isFresh => signal.isFresh();
+  double get meters => signal.meters;
+  String get distanceText => signal.distanceText;
+  double get heat => signal.heat;
+  Trend get trend => signal.trend;
+  void update(int rssi, DateTime stamp) => signal.update(rssi, stamp);
 
   // Only a camera-like WORD in the name is noted. Unknown names or unknown
   // manufacturers are never treated as suspicious.
@@ -125,6 +117,12 @@ IconData _iconFor(DeviceCategory? c) => switch (c) {
       DeviceCategory.beacon => Icons.sensors,
       DeviceCategory.other => Icons.devices_other,
       _ => Icons.bluetooth,
+    };
+
+String _trendGlyph(Trend t) => switch (t) {
+      Trend.warmer => '▲ ',
+      Trend.colder => '▼ ',
+      _ => '',
     };
 
 String _ago(DateTime t) {
@@ -153,61 +151,131 @@ class _BleScreenState extends State<BleScreen> {
   String? _selected;
   String? _error;
 
+  // Beep / vibrate / ripple timing for the tracked device.
+  late final PulseEngine _engine = PulseEngine(heat: () {
+    final d = _selected == null ? null : _devices[_selected];
+    if (d == null || !d.isFresh) return null;
+    return d.heat;
+  });
+
   @override
   void dispose() {
     _stop();
+    _engine.dispose();
     super.dispose();
+  }
+
+  void _syncEngine() {
+    if (_scanning && _selected != null) {
+      _engine.start();
+    } else {
+      _engine.stop();
+    }
+  }
+
+  void _select(String? id) {
+    setState(() => _selected = id);
+    _syncEngine();
+  }
+
+  void _cycleOutput() {
+    setState(() {
+      _engine.output = switch (_engine.output) {
+        PulseOutput.sound => PulseOutput.vibrate,
+        PulseOutput.vibrate => PulseOutput.off,
+        PulseOutput.off => PulseOutput.sound,
+      };
+    });
   }
 
   Future<void> _start() async {
     setState(() => _error = null);
 
-    final statuses = await [
-      Permission.bluetoothScan,
-      Permission.bluetoothConnect,
-      Permission.locationWhenInUse,
-    ].request();
-    final denied = statuses.values.any((s) => s.isPermanentlyDenied);
-    if (denied) {
-      setState(() => _error = 'Bluetooth permission is blocked. Enable it in Settings.');
-      return;
-    }
-
-    if (await FlutterBluePlus.adapterState.first != BluetoothAdapterState.on) {
-      setState(() => _error = 'Please turn Bluetooth on.');
-      return;
-    }
-
-    // Devices already paired with this phone: Android knows their names.
     try {
-      _bonded.clear();
-      for (final d in await FlutterBluePlus.bondedDevices) {
-        _bonded[d.remoteId.str] =
-            BleIdentity.cleanName(d.platformName, remoteId: d.remoteId.str);
+      final statuses = await [
+        Permission.bluetoothScan,
+        Permission.bluetoothConnect,
+        Permission.locationWhenInUse,
+      ].request();
+      if (!mounted) return;
+
+      // Android 12+ needs "Nearby devices"; Android 11 and older need Location.
+      // permission_handler can report the Android 12 permissions oddly on older
+      // phones, so scanning is blocked only when neither one is granted.
+      final scanOk = statuses[Permission.bluetoothScan]?.isGranted ?? false;
+      final locOk = statuses[Permission.locationWhenInUse]?.isGranted ?? false;
+      if (!scanOk && !locOk) {
+        final blocked = statuses.values.any((s) => s.isPermanentlyDenied);
+        setState(() => _error = blocked
+            ? 'Bluetooth permission is blocked. Enable it in Settings.'
+            : 'Bluetooth and location permission are required to scan nearby devices.');
+        return;
       }
-    } catch (_) {
-      // Not available on this platform; scanning still works.
+
+      if (await FlutterBluePlus.adapterState.first != BluetoothAdapterState.on) {
+        if (mounted) setState(() => _error = 'Please turn Bluetooth on.');
+        return;
+      }
+
+      // Devices already paired with this phone: Android knows their names.
+      try {
+        _bonded.clear();
+        for (final d in await FlutterBluePlus.bondedDevices) {
+          _bonded[d.remoteId.str] =
+              BleIdentity.cleanName(d.platformName, remoteId: d.remoteId.str);
+        }
+      } catch (_) {
+        // Not available on this platform; BLE scanning still works.
+      }
+
+      await _sub?.cancel();
+      _sub = FlutterBluePlus.scanResults.listen(
+        _onResults,
+        onError: (Object error) {
+          if (mounted) {
+            setState(() => _error = 'Bluetooth scanning error: $error');
+          }
+        },
+      );
+      await FlutterBluePlus.startScan(
+        continuousUpdates: true, // keep RSSI updating while walking
+        androidScanMode: AndroidScanMode.lowLatency,
+      );
+
+      // Refresh the UI four times a second and drop stale devices.
+      _ui?.cancel();
+      _ui = Timer.periodic(const Duration(milliseconds: 250), (_) {
+        final cutoff = DateTime.now().subtract(const Duration(seconds: 15));
+        _devices.removeWhere((k, v) => v.lastSeen.isBefore(cutoff) && k != _selected);
+        if (mounted) setState(() {});
+      });
+      if (mounted) setState(() => _scanning = true);
+      _syncEngine();
+    } catch (error) {
+      _engine.stop();
+      _ui?.cancel();
+      await _sub?.cancel();
+      _sub = null;
+      try {
+        await FlutterBluePlus.stopScan();
+      } catch (_) {}
+      if (mounted) {
+        setState(() {
+          _scanning = false;
+          _error = 'Unable to start Bluetooth scanning: $error';
+        });
+      }
     }
-
-    _sub = FlutterBluePlus.scanResults.listen(_onResults);
-    await FlutterBluePlus.startScan(
-      continuousUpdates: true, // keep RSSI updating while walking
-      androidScanMode: AndroidScanMode.lowLatency,
-    );
-
-    // Refresh UI twice a second and drop stale devices.
-    _ui = Timer.periodic(const Duration(milliseconds: 500), (_) {
-      final cutoff = DateTime.now().subtract(const Duration(seconds: 15));
-      _devices.removeWhere((k, v) => v.lastSeen.isBefore(cutoff) && k != _selected);
-      if (mounted) setState(() {});
-    });
-    setState(() => _scanning = true);
   }
 
   Future<void> _stop() async {
+    _engine.stop();
     _ui?.cancel();
     await _sub?.cancel();
-    await FlutterBluePlus.stopScan();
+    _sub = null;
+    try {
+      await FlutterBluePlus.stopScan();
+    } catch (_) {}
     if (mounted) setState(() => _scanning = false);
   }
 
@@ -231,6 +299,7 @@ class _BleScreenState extends State<BleScreen> {
 
   // Read the standard Device Name (0x2A00). Only runs after the user confirms.
   Future<void> _identify(Tracked t) async {
+    if (t.identifying) return;
     setState(() {
       t.identifying = true;
       t.nameReadFailed = false;
@@ -238,7 +307,7 @@ class _BleScreenState extends State<BleScreen> {
     final dev = BluetoothDevice.fromId(t.id);
     String? name;
     try {
-      await dev.connect(license: License.free, timeout: const Duration(seconds: 8));
+      await dev.connect(license: License.nonprofit, timeout: const Duration(seconds: 8));
       final services = await dev.discoverServices();
       for (final s in services) {
         if (s.uuid.str.toLowerCase() != '1800') continue;
@@ -256,8 +325,16 @@ class _BleScreenState extends State<BleScreen> {
       } catch (_) {}
     }
     if (name != null) {
-      t.gattName = name;
-      _nameCache[t.id] = name;
+      t.gattName = BleIdentity.preferName(
+        t.gattName,
+        name,
+        remoteId: t.id,
+      );
+      _nameCache[t.id] = BleIdentity.preferName(
+        _nameCache[t.id],
+        name,
+        remoteId: t.id,
+      )!;
     } else {
       t.nameReadFailed = true; // never overwrites an existing name
     }
@@ -297,6 +374,9 @@ class _BleScreenState extends State<BleScreen> {
 
   void _onResults(List<ScanResult> results) {
     for (final r in results) {
+      // The plugin re-sends old results; ignore devices not heard recently.
+      if (DateTime.now().difference(r.timeStamp).inSeconds > 10) continue;
+
       final id = r.device.remoteId.str;
       final ad = r.advertisementData;
 
@@ -308,19 +388,43 @@ class _BleScreenState extends State<BleScreen> {
         return n;
       });
 
-      // Names: only ever replace with a valid, non-empty value.
-      final adName = BleIdentity.cleanName(ad.advName, remoteId: id);
-      final platName = BleIdentity.cleanName(r.device.platformName, remoteId: id) ??
-          _bonded[id];
-      if (adName != null) t.advName = adName;
-      if (platName != null) t.platformName = platName;
-      final seen = adName ?? platName;
-      if (seen != null) _nameCache[id] = seen;
+      // flutter_blue_plus exposes the Android advertisement and scan-response
+      // local name together as advName. Keep valid values from each source
+      // separately so the hierarchy remains explicit and stable.
+      t.advName = BleIdentity.preferName(
+        t.advName,
+        ad.advName,
+        remoteId: id,
+      );
+      t.platformName = BleIdentity.preferName(
+        t.platformName,
+        r.device.platformName,
+        remoteId: id,
+      );
+      t.platformName = BleIdentity.preferName(
+        t.platformName,
+        _bonded[id],
+        remoteId: id,
+      );
+      final seen = t.advName ?? t.platformName;
+      if (seen != null) {
+        _nameCache[id] = BleIdentity.preferName(
+          _nameCache[id],
+          seen,
+          remoteId: id,
+        )!;
+      }
 
       if (ad.manufacturerData.isNotEmpty) {
-        final e = ad.manufacturerData.entries.first;
-        t.companyId = e.key;
-        t.payload = e.value;
+        var selectedId = ad.manufacturerData.keys.first;
+        for (final companyId in ad.manufacturerData.keys) {
+          if (BleIdentity.manufacturer(companyId) != null) {
+            selectedId = companyId;
+            break;
+          }
+        }
+        t.companyId = selectedId;
+        t.payload = ad.manufacturerData[selectedId] ?? const [];
       }
       for (final g in ad.serviceUuids) {
         t.services.add(g.str.toLowerCase());
@@ -328,7 +432,7 @@ class _BleScreenState extends State<BleScreen> {
       if (ad.appearance != null) t.appearance = ad.appearance;
       t.connectable = ad.connectable;
 
-      t.update(r.rssi, ad.txPowerLevel);
+      t.update(r.rssi, r.timeStamp);
     }
   }
 
@@ -358,11 +462,14 @@ class _BleScreenState extends State<BleScreen> {
             ),
           if (sel != null)
             ConstrainedBox(
-              constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.5),
+              constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.68),
               child: SingleChildScrollView(
                 child: _MeterCard(
                   device: sel,
-                  onClose: () => setState(() => _selected = null),
+                  pulses: _engine.pulses,
+                  output: _engine.output,
+                  onOutput: _cycleOutput,
+                  onClose: () => _select(null),
                   onIdentify: () => _confirmAndIdentify(sel),
                   onNote: () => _editNote(sel),
                 ),
@@ -385,7 +492,10 @@ class _BleScreenState extends State<BleScreen> {
                 final d = list[i];
                 final cat = d.category;
                 final line1 = [
-                  d.manufacturer ?? 'Unknown manufacturer',
+                  d.manufacturer ??
+                      (d.brandHint != null
+                          ? 'Brand in name: ${d.brandHint}'
+                          : 'Unknown manufacturer'),
                   if (cat != null) cat.category.label,
                 ].join(' · ');
                 return ListTile(
@@ -395,19 +505,18 @@ class _BleScreenState extends State<BleScreen> {
                     color: d.flagged ? Colors.orange : null,
                   ),
                   title: Text(d.displayName.isEmpty ? 'Unnamed device' : d.displayName),
-                  subtitle: Text(
-                      '$line1\n~${d.meters.toStringAsFixed(1)} m · ${_ago(d.lastSeen)}'),
+                  subtitle: Text('$line1\n${d.distanceText} · ${_ago(d.lastSeen)}'),
                   trailing: Column(
                     mainAxisSize: MainAxisSize.min,
                     mainAxisAlignment: MainAxisAlignment.center,
                     crossAxisAlignment: CrossAxisAlignment.end,
                     children: [
-                      Text('${d.ema?.round() ?? "-"} dBm'),
+                      Text('${_trendGlyph(d.trend)}${d.ema?.round() ?? "-"} dBm'),
                       Text(d.status.label, style: Theme.of(context).textTheme.labelSmall),
                     ],
                   ),
                   selected: d.id == _selected,
-                  onTap: () => setState(() => _selected = d.id),
+                  onTap: () => _select(d.id),
                 );
               },
             ),
@@ -418,27 +527,59 @@ class _BleScreenState extends State<BleScreen> {
   }
 }
 
-// ---------- Hot / cold meter + identification details ----------
+// ---------- Detector card ----------
 
 class _MeterCard extends StatelessWidget {
   final Tracked device;
+  final ValueListenable<int> pulses;
+  final PulseOutput output;
+  final VoidCallback onOutput;
   final VoidCallback onClose;
   final VoidCallback onIdentify;
   final VoidCallback onNote;
   const _MeterCard({
     required this.device,
+    required this.pulses,
+    required this.output,
+    required this.onOutput,
     required this.onClose,
     required this.onIdentify,
     required this.onNote,
   });
 
   String get _label {
+    if (!device.isFresh) return 'No signal';
     final h = device.heat;
     if (h > 0.85) return 'Very close';
     if (h > 0.65) return 'Hot';
     if (h > 0.4) return 'Warm';
     return 'Cold';
   }
+
+  String get _trendText => switch (device.trend) {
+        Trend.warmer => '▲ Getting warmer (closer)',
+        Trend.colder => '▼ Getting colder (farther)',
+        Trend.steady => '● Steady',
+        Trend.unknown => 'Move around to see the trend',
+      };
+
+  Color get _trendColor => switch (device.trend) {
+        Trend.warmer => Colors.red,
+        Trend.colder => Colors.blue,
+        _ => Colors.grey,
+      };
+
+  IconData get _outputIcon => switch (output) {
+        PulseOutput.sound => Icons.volume_up,
+        PulseOutput.vibrate => Icons.vibration,
+        PulseOutput.off => Icons.volume_off,
+      };
+
+  String get _outputLabel => switch (output) {
+        PulseOutput.sound => 'Sound',
+        PulseOutput.vibrate => 'Vibrate',
+        PulseOutput.off => 'Silent',
+      };
 
   List<String> get _details {
     final d = device;
@@ -465,6 +606,7 @@ class _MeterCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     final color = Color.lerp(Colors.blue, Colors.red, device.heat)!;
     return Card(
       margin: const EdgeInsets.all(12),
@@ -477,46 +619,45 @@ class _MeterCard extends StatelessWidget {
               Expanded(
                 child: Text(
                   device.displayName.isEmpty ? 'Unnamed device' : device.displayName,
-                  style: Theme.of(context).textTheme.titleMedium,
+                  style: theme.textTheme.titleMedium,
                 ),
               ),
               IconButton(onPressed: onClose, icon: const Icon(Icons.close)),
             ]),
-            Text(_label,
-                style: Theme.of(context).textTheme.headlineMedium?.copyWith(color: color)),
-            const SizedBox(height: 8),
-            LinearProgressIndicator(
-              value: device.heat,
-              minHeight: 14,
-              color: color,
-              borderRadius: BorderRadius.circular(8),
+            Center(
+              child: SizedBox(
+                width: 230,
+                height: 230,
+                child: DetectorView(
+                  heat: device.heat,
+                  color: color,
+                  pulses: pulses,
+                  title: _label,
+                  subtitle: '${device.distanceText} · ${device.ema?.round()} dBm',
+                ),
+              ),
             ),
-            const SizedBox(height: 8),
-            Text('Now ${device.ema?.round()} dBm · Peak ${device.peak} dBm · '
-                'about ${device.meters.toStringAsFixed(1)} m'),
+            Center(
+              child: Text(_trendText,
+                  style: theme.textTheme.titleMedium
+                      ?.copyWith(color: _trendColor, fontWeight: FontWeight.w600)),
+            ),
+            Center(
+              child: Text('Peak ${device.peak} dBm', style: theme.textTheme.bodySmall),
+            ),
             if (device.suspectName)
               const Padding(
                 padding: EdgeInsets.only(top: 6),
                 child: Text('The name contains a camera-like word. Worth a closer look.',
                     style: TextStyle(color: Colors.orange)),
               ),
-            const Divider(height: 24),
-            for (final line in _details)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 2),
-                child: Text(line, style: Theme.of(context).textTheme.bodySmall),
-              ),
-            if (device.manufacturer != null)
-              Padding(
-                padding: const EdgeInsets.only(top: 4),
-                child: Text(
-                  'The company ID shows who registered it, often the chip or '
-                  'firmware maker, not always the product brand.',
-                  style: Theme.of(context).textTheme.labelSmall,
-                ),
-              ),
             const SizedBox(height: 10),
             Wrap(spacing: 8, children: [
+              OutlinedButton.icon(
+                onPressed: onOutput,
+                icon: Icon(_outputIcon),
+                label: Text(_outputLabel),
+              ),
               if (device.connectable != false)
                 OutlinedButton.icon(
                   onPressed: device.identifying ? null : onIdentify,
@@ -534,6 +675,30 @@ class _MeterCard extends StatelessWidget {
                 label: Text(device.userNote == null ? 'Add note' : 'Edit note'),
               ),
             ]),
+            ExpansionTile(
+              title: const Text('Details'),
+              tilePadding: EdgeInsets.zero,
+              childrenPadding: const EdgeInsets.only(bottom: 8),
+              shape: const Border(),
+              collapsedShape: const Border(),
+              expandedCrossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                for (final line in _details)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 2),
+                    child: Text(line, style: theme.textTheme.bodySmall),
+                  ),
+                if (device.manufacturer != null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Text(
+                      'The company ID shows who registered it, often the chip or '
+                      'firmware maker, not always the product brand.',
+                      style: theme.textTheme.labelSmall,
+                    ),
+                  ),
+              ],
+            ),
           ],
         ),
       ),
