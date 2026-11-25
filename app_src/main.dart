@@ -18,12 +18,37 @@ class SweepApp extends StatelessWidget {
 
 // ---------- Model ----------
 
+// Common Bluetooth SIG company IDs. Later: bundle the full official list.
 const _companyIds = {
   0x004C: 'Apple',
   0x0006: 'Microsoft',
   0x0075: 'Samsung',
   0x00E0: 'Google',
   0x0059: 'Nordic Semi',
+  0x0002: 'Intel',
+  0x000F: 'Broadcom',
+  0x000A: 'Qualcomm (CSR)',
+  0x000D: 'Texas Instruments',
+  0x005D: 'Realtek',
+  0x0087: 'Garmin',
+  0x009E: 'Bose',
+  0x012D: 'Sony',
+  0x0171: 'Amazon',
+  0x027D: 'Huawei',
+  0x02E5: 'Espressif (ESP chips, common in cheap cameras/IoT)',
+  0x038F: 'Xiaomi',
+};
+
+// 16-bit service UUIDs that hint at what a device is.
+const _serviceLabels = {
+  '180d': 'Heart-rate (wearable)',
+  '1812': 'Keyboard / mouse / HID',
+  '1802': 'Find-my style tag',
+  '181a': 'Environment sensor',
+  '1826': 'Fitness equipment',
+  'fe2c': 'Google Fast Pair (earbuds etc.)',
+  'feaa': 'Beacon (Eddystone)',
+  'fd6f': 'Exposure notification',
 };
 
 const _suspectWords = ['cam', 'ipc', 'spy', 'hidden', 'ipcam', 'wifi', 'mini'];
@@ -36,8 +61,24 @@ class Tracked {
   int peak = -127;
   int txPower = -59; // assumed RSSI at 1 m
   DateTime lastSeen = DateTime.now();
+  String? gattName; // name read by connecting (the "Settings" trick)
+  Set<String> services = {};
+  bool identifying = false;
 
   Tracked(this.id, this.name, this.maker);
+
+  String get displayName {
+    if (name.isNotEmpty) return name;
+    if (gattName != null && !gattName!.startsWith('(')) return gattName!;
+    return '';
+  }
+
+  String? get kind {
+    for (final s in services) {
+      if (_serviceLabels.containsKey(s)) return _serviceLabels[s];
+    }
+    return null;
+  }
 
   void update(int rssi, int? tx) {
     const alpha = 0.25;
@@ -56,10 +97,11 @@ class Tracked {
   // 0.0 (cold) .. 1.0 (hot)
   double get heat => (((ema ?? -100) + 100) / 60).clamp(0.0, 1.0);
 
-  bool get unidentified => name.isEmpty && maker.startsWith('Unknown');
+  bool get unidentified =>
+      displayName.isEmpty && maker.startsWith('Unknown') && kind == null;
 
   bool get suspectName {
-    final n = name.toLowerCase();
+    final n = displayName.toLowerCase();
     return _suspectWords.any(n.contains);
   }
 
@@ -129,6 +171,33 @@ class _BleScreenState extends State<BleScreen> {
     if (mounted) setState(() => _scanning = false);
   }
 
+  // Briefly connect (read-only) and read the standard Device Name (0x2A00).
+  Future<void> _identify(Tracked t) async {
+    setState(() => t.identifying = true);
+    final dev = BluetoothDevice.fromId(t.id);
+    try {
+      await dev.connect(timeout: const Duration(seconds: 8));
+      final services = await dev.discoverServices();
+      for (final s in services) {
+        if (s.uuid.str.toLowerCase() != '1800') continue;
+        for (final c in s.characteristics) {
+          if (c.uuid.str.toLowerCase() == '2a00') {
+            final v = await c.read();
+            t.gattName = String.fromCharCodes(v);
+          }
+        }
+      }
+      t.gattName ??= '(device does not share a name)';
+    } catch (_) {
+      t.gattName = '(could not connect)';
+    } finally {
+      try {
+        await dev.disconnect();
+      } catch (_) {}
+      if (mounted) setState(() => t.identifying = false);
+    }
+  }
+
   void _onResults(List<ScanResult> results) {
     for (final r in results) {
       final id = r.device.remoteId.str;
@@ -144,6 +213,9 @@ class _BleScreenState extends State<BleScreen> {
 
       final t = _devices.putIfAbsent(id, () => Tracked(id, name, maker));
       if (name.isNotEmpty) t.name = name;
+      for (final g in ad.serviceUuids) {
+        t.services.add(g.str.toLowerCase());
+      }
       t.update(r.rssi, ad.txPowerLevel);
     }
   }
@@ -172,7 +244,12 @@ class _BleScreenState extends State<BleScreen> {
                     child: const Text('OK'))
               ],
             ),
-          if (sel != null) _MeterCard(device: sel, onClose: () => setState(() => _selected = null)),
+          if (sel != null)
+            _MeterCard(
+              device: sel,
+              onClose: () => setState(() => _selected = null),
+              onIdentify: () => _identify(sel),
+            ),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
             child: Text(
@@ -193,8 +270,9 @@ class _BleScreenState extends State<BleScreen> {
                     d.flagged ? Icons.warning_amber_rounded : Icons.bluetooth,
                     color: d.flagged ? Colors.orange : null,
                   ),
-                  title: Text(d.name.isEmpty ? 'Unnamed device' : d.name),
-                  subtitle: Text('${d.maker} · ~${d.meters.toStringAsFixed(1)} m'),
+                  title: Text(d.displayName.isEmpty ? 'Unnamed device' : d.displayName),
+                  subtitle: Text(
+                      '${d.maker}${d.kind != null ? " · ${d.kind}" : ""} · ~${d.meters.toStringAsFixed(1)} m'),
                   trailing: Text('${d.ema?.round() ?? "-"} dBm'),
                   selected: d.id == _selected,
                   onTap: () => setState(() => _selected = d.id),
@@ -213,7 +291,9 @@ class _BleScreenState extends State<BleScreen> {
 class _MeterCard extends StatelessWidget {
   final Tracked device;
   final VoidCallback onClose;
-  const _MeterCard({required this.device, required this.onClose});
+  final VoidCallback onIdentify;
+  const _MeterCard(
+      {required this.device, required this.onClose, required this.onIdentify});
 
   String get _label {
     final h = device.heat;
@@ -236,12 +316,30 @@ class _MeterCard extends StatelessWidget {
             Row(children: [
               Expanded(
                 child: Text(
-                  device.name.isEmpty ? 'Unnamed device' : device.name,
+                  device.displayName.isEmpty ? 'Unnamed device' : device.displayName,
                   style: Theme.of(context).textTheme.titleMedium,
                 ),
               ),
               IconButton(onPressed: onClose, icon: const Icon(Icons.close)),
             ]),
+            Row(children: [
+              OutlinedButton.icon(
+                onPressed: device.identifying ? null : onIdentify,
+                icon: device.identifying
+                    ? const SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Icon(Icons.badge_outlined),
+                label: Text(device.identifying ? 'Connecting...' : 'Read name'),
+              ),
+              const SizedBox(width: 10),
+              if (device.gattName != null && device.gattName!.startsWith('('))
+                Flexible(
+                    child: Text(device.gattName!,
+                        style: Theme.of(context).textTheme.bodySmall)),
+            ]),
+            const SizedBox(height: 6),
             Text(_label,
                 style: Theme.of(context)
                     .textTheme
