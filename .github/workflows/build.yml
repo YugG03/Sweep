@@ -25,18 +25,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Download repository
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. Configure Java
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      # 3. Setup Flutter with caching
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -44,55 +41,58 @@ jobs:
           cache: true
           pub-cache: true
 
-      # 4. Generate project shell
       - name: Create Flutter project shell
         run: |
           flutter create --org com.example --project-name sweep_app --platforms=android,ios .
 
-      # 5. Install Android SDK 37
       - name: Install Android SDK 37
         run: |
-          sdkmanager "platforms;android-37"
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
 
-      # 6. Add existing dependencies
+          SDKMANAGER=$(find "${ANDROID_HOME:-$ANDROID_SDK_ROOT}" \
+            -type f -name sdkmanager 2>/dev/null | head -n 1)
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "ERROR: sdkmanager was not found."
+            find "${ANDROID_HOME:-$ANDROID_SDK_ROOT}" \
+              -maxdepth 4 -type f -name sdkmanager 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "Using sdkmanager: $SDKMANAGER"
+          "$SDKMANAGER" "platforms;android-37"
+
       - name: Add packages
         run: |
           flutter pub add flutter_blue_plus permission_handler
 
-      # 7. Configure Gradle caching
       - name: Setup Gradle cache
         uses: gradle/actions/setup-gradle@v6
         with:
           cache-provider: basic
 
-      # 8. Copy Sweep application
       - name: Use our app code
         run: |
           cp app_src/main.dart lib/main.dart
 
-      # 9. Add Bluetooth permissions
       - name: Configure Bluetooth permissions
         run: |
           MANIFEST=android/app/src/main/AndroidManifest.xml
 
           sed -i 's#<application#<uses-permission android:name="android.permission.BLUETOOTH_SCAN" />\n    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />\n    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />\n    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />\n    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />\n    <application#' "$MANIFEST"
 
-      # 10. Configure compile SDK
       - name: Configure Android compile SDK
         run: |
           sed -i 's/compileSdk = .*/compileSdk = 37/' android/app/build.gradle.kts
           grep -n "compileSdk" android/app/build.gradle.kts
 
-      # 11. Resolve packages
       - name: Get Flutter dependencies
         run: flutter pub get
 
-      # 12. Build selected APK
       - name: Build APK
-        run: |
-          flutter build apk --${{ inputs.build_type }}
+        run: flutter build apk --${{ inputs.build_type }}
 
-      # 13. Upload APK
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
